@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const {
   Client, GatewayIntentBits, AttachmentBuilder, EmbedBuilder,
+  ActionRowBuilder, ButtonBuilder, ButtonStyle,
   ChannelType, PermissionFlagsBits, Events,
 } = require('discord.js');
 
@@ -212,20 +213,21 @@ async function findInactives(guild) {
     }
     const inVoice = !!member.voice?.channelId || (u && u.v > vcCutoff);
     if (msgs <= MAX_MESSAGES && !inVoice) {
-      const last = lastDay ? new Date(lastDay * DAY).toISOString().slice(0, 10) : 'none in window';
       out.push({
-        tag: member.user.tag, id: member.id, msgs, last,
-        joined: member.joinedTimestamp ? new Date(member.joinedTimestamp).toISOString().slice(0, 10) : '?',
+        tag: member.user.tag, id: member.id, msgs,
+        lastTs: lastDay ? lastDay * DAY : 0,
+        joined: member.joinedTimestamp || 0,
       });
     }
   }
-  out.sort((a, b) => a.msgs - b.msgs || a.joined.localeCompare(b.joined));
+  out.sort((a, b) => a.msgs - b.msgs || a.joined - b.joined);
   return out;
 }
 
 function buildText(list) {
+  const iso = ts => (ts ? new Date(ts).toISOString().slice(0, 10) : 'none in window');
   const lines = list.map(i =>
-    `${i.tag} | ${i.id} | messages: ${i.msgs} | last msg day: ${i.last} | joined: ${i.joined}`);
+    `${i.tag} | ${i.id} | messages: ${i.msgs} | last msg day: ${iso(i.lastTs)} | joined: ${iso(i.joined)}`);
   return [
     `Inactive members - generated ${new Date().toISOString()}`,
     `Criteria: <= ${MAX_MESSAGES} messages and no voice activity in the last ${WINDOW_DAYS} days`,
@@ -243,12 +245,57 @@ async function buildReport() {
   const list = await findInactives(guild);
   const text = buildText(list);
   try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(INACTIVE_FILE, text); } catch { /* ignore */ }
-  const file = new AttachmentBuilder(Buffer.from(text), { name: `inactives-${new Date().toISOString().slice(0, 10)}.txt` });
-  const embed = new EmbedBuilder()
-    .setTitle('Inactive member report')
-    .setDescription(`**${list.length}** inactive (<= ${MAX_MESSAGES} msgs, no VC, last ${WINDOW_DAYS} days). Full list attached.`)
-    .setTimestamp();
-  return { list, file, embed };
+  return { list, text };
+}
+
+// ---------- pretty report (embed + buttons) ----------
+const PAGE_SIZE = 10;
+const reportCache = new Map(); // messageId -> { list, text, page }
+
+function cacheReport(messageId, list, text) {
+  reportCache.set(messageId, { list, text, page: 0 });
+  if (reportCache.size > 20) reportCache.delete(reportCache.keys().next().value);
+}
+
+const stamp = ts => `<t:${Math.floor(ts / 1000)}:D>`;
+
+function renderPage(list, page) {
+  const pages = Math.max(1, Math.ceil(list.length / PAGE_SIZE));
+  page = Math.min(Math.max(page, 0), pages - 1);
+
+  const embed = new EmbedBuilder().setTimestamp();
+
+  if (!list.length) {
+    embed
+      .setColor(0x2ecc71)
+      .setTitle('✅ No inactive members')
+      .setDescription(`Everyone has more than **${MAX_MESSAGES}** messages or voice activity in the last **${WINDOW_DAYS} days**.`);
+    return { payload: { embeds: [embed], components: [] }, page: 0 };
+  }
+
+  const slice = list.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+  const rows = slice.map((m, idx) => {
+    const n = page * PAGE_SIZE + idx + 1;
+    const last = m.lastTs ? stamp(m.lastTs) : 'none in window';
+    const joined = m.joined ? stamp(m.joined) : 'unknown';
+    return `**${n}.** <@${m.id}> · \`${m.id}\`\n└ 💬 ${m.msgs} msg${m.msgs === 1 ? '' : 's'} · last msg: ${last} · joined: ${joined}`;
+  });
+
+  embed
+    .setColor(0xe67e22)
+    .setTitle('😴 Inactive member report')
+    .setDescription(
+      `**${list.length}** member${list.length === 1 ? '' : 's'} with **≤ ${MAX_MESSAGES} messages** and **no voice activity** in the last **${WINDOW_DAYS} days**.\n\n` +
+      rows.join('\n\n'))
+    .setFooter({ text: `Page ${page + 1}/${pages}` });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('inact_prev').setLabel('◀').setStyle(ButtonStyle.Secondary).setDisabled(page === 0),
+    new ButtonBuilder().setCustomId('inact_page').setLabel(`${page + 1}/${pages}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
+    new ButtonBuilder().setCustomId('inact_next').setLabel('▶').setStyle(ButtonStyle.Secondary).setDisabled(page >= pages - 1),
+    new ButtonBuilder().setCustomId('inact_txt').setLabel('Export .txt').setEmoji('📄').setStyle(ButtonStyle.Primary),
+  );
+  return { payload: { embeds: [embed], components: [row] }, page };
 }
 
 async function maybeDailyReport() {
@@ -257,9 +304,10 @@ async function maybeDailyReport() {
   const today = now.toISOString().slice(0, 10);
   if (state.lastReport === today || now.getUTCHours() < REPORT_HOUR_UTC) return;
   try {
-    const { file, embed } = await buildReport();
+    const { list, text } = await buildReport();
     const ch = await client.channels.fetch(REPORT_CHANNEL_ID);
-    await ch.send({ embeds: [embed], files: [file] });
+    const msg = await ch.send(renderPage(list, 0).payload);
+    cacheReport(msg.id, list, text);
     state.lastReport = today;
     saveLocal();
     await backupToDiscord();
@@ -268,16 +316,38 @@ async function maybeDailyReport() {
   }
 }
 
-// ---------- slash command: /inactives ----------
+// ---------- interactions: /inactives + page buttons ----------
 client.on(Events.InteractionCreate, async i => {
-  if (!i.isChatInputCommand() || i.commandName !== 'inactives') return;
-  if (!ready) return i.reply({ content: 'Still catching up on history, try again in a few minutes.', ephemeral: true });
-  await i.deferReply({ ephemeral: true });
   try {
-    const { file, embed } = await buildReport();
-    await i.editReply({ embeds: [embed], files: [file] });
+    if (i.isChatInputCommand() && i.commandName === 'inactives') {
+      if (!ready) return i.reply({ content: 'Still catching up on history, try again in a few minutes.', ephemeral: true });
+      await i.deferReply({ ephemeral: true });
+      const { list, text } = await buildReport();
+      const msg = await i.editReply(renderPage(list, 0).payload);
+      cacheReport(msg.id, list, text);
+      return;
+    }
+
+    if (i.isButton() && i.customId.startsWith('inact_')) {
+      if (!i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+        return i.reply({ content: 'You need Manage Server to use this.', ephemeral: true });
+      }
+      const entry = reportCache.get(i.message.id);
+      if (!entry) {
+        return i.reply({ content: 'This report expired (the bot restarted). Run `/inactives` for a fresh one.', ephemeral: true });
+      }
+      if (i.customId === 'inact_txt') {
+        const file = new AttachmentBuilder(Buffer.from(entry.text), { name: `inactives-${new Date().toISOString().slice(0, 10)}.txt` });
+        return i.reply({ files: [file], ephemeral: true });
+      }
+      entry.page += i.customId === 'inact_next' ? 1 : -1;
+      const { payload, page } = renderPage(entry.list, entry.page);
+      entry.page = page;
+      return i.update(payload);
+    }
   } catch (e) {
-    await i.editReply(`Failed: ${e.message}`);
+    console.warn('Interaction failed:', e.message);
+    if (i.deferred && !i.replied) i.editReply(`Failed: ${e.message}`).catch(() => {});
   }
 });
 
