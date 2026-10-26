@@ -188,7 +188,11 @@ async function backfill(guild) {
 
 // ---------- inactivity detection ----------
 async function findInactives(guild) {
-  await guild.members.fetch();
+  // member cache is already filled at boot and kept live by the GuildMembers intent;
+  // re-fetching here trips Discord's member-request rate limit (opcode 8)
+  if (guild.members.cache.size < guild.memberCount) {
+    try { await guild.members.fetch(); } catch (e) { console.warn('Member fetch skipped:', e.message); }
+  }
   const now = Date.now();
   const minKey = dayKey() - WINDOW_DAYS;
   const vcCutoff = now - WINDOW_DAYS * DAY;
