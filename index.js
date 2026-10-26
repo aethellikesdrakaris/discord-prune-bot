@@ -1,3 +1,4 @@
+require('dotenv').config(); // loads .env if present; real env vars still win
 const fs = require('fs');
 const path = require('path');
 const {
