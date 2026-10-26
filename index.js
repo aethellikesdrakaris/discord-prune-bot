@@ -29,7 +29,7 @@ if (!DISCORD_TOKEN || !GUILD_ID || !REPORT_CHANNEL_ID) {
 }
 
 // ---------- state ----------
-// users[userId] = { d: { "<dayIndex>": messageCount }, v: lastVoiceTimestamp }
+// users[userId] = { d: { "<dayIndex>": messageCount } }
 let state = { version: 1, lastReport: null, heartbeat: 0, users: {} };
 let loadedFrom = null;
 let ready = false; // true once boot backfill is finished
@@ -37,21 +37,15 @@ let ready = false; // true once boot backfill is finished
 const dayKey = (ts = Date.now()) => Math.floor(ts / DAY);
 
 function bumpMessage(userId, ts = Date.now()) {
-  const u = (state.users[userId] ??= { d: {}, v: 0 });
+  const u = (state.users[userId] ??= { d: {} });
   const k = dayKey(ts);
   u.d[k] = (u.d[k] || 0) + 1;
 }
-function bumpVoice(userId, ts = Date.now()) {
-  const u = (state.users[userId] ??= { d: {}, v: 0 });
-  u.v = Math.max(u.v, ts);
-}
-
 function pruneData() {
   const minKey = dayKey() - WINDOW_DAYS; // keep keys >= minKey (full window + today)
-  const vcCutoff = Date.now() - WINDOW_DAYS * DAY;
   for (const [id, u] of Object.entries(state.users)) {
     for (const k of Object.keys(u.d)) if (Number(k) < minKey) delete u.d[k];
-    if (!Object.keys(u.d).length && u.v < vcCutoff) delete state.users[id];
+    if (!Object.keys(u.d).length) delete state.users[id];
   }
 }
 
@@ -134,18 +128,12 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,      // privileged: enable in Dev Portal
     GatewayIntentBits.GuildMessages,     // no Message Content intent needed
-    GatewayIntentBits.GuildVoiceStates,
   ],
 });
 
 client.on(Events.MessageCreate, m => {
   if (m.guildId !== GUILD_ID || m.author.bot || m.webhookId) return;
   bumpMessage(m.author.id, m.createdTimestamp);
-});
-
-client.on(Events.VoiceStateUpdate, (_old, n) => {
-  if (n.guild.id !== GUILD_ID || n.member?.user.bot || !n.channelId) return;
-  bumpVoice(n.id);
 });
 
 client.on(Events.GuildMemberRemove, m => {
@@ -183,8 +171,6 @@ async function backfill(guild) {
       console.warn(`Backfill skipped #${ch.name}: ${e.message}`);
     }
   }
-  // anyone sitting in voice right now counts as active
-  guild.voiceStates.cache.forEach(vs => { if (vs.channelId && !vs.member?.user.bot) bumpVoice(vs.id); });
 }
 
 // ---------- inactivity detection ----------
@@ -196,7 +182,6 @@ async function findInactives(guild) {
   }
   const now = Date.now();
   const minKey = dayKey() - WINDOW_DAYS;
-  const vcCutoff = now - WINDOW_DAYS * DAY;
   const out = [];
 
   for (const member of guild.members.cache.values()) {
@@ -211,8 +196,7 @@ async function findInactives(guild) {
         if (Number(k) >= minKey) { msgs += n; lastDay = Math.max(lastDay, Number(k)); }
       }
     }
-    const inVoice = !!member.voice?.channelId || (u && u.v > vcCutoff);
-    if (msgs <= MAX_MESSAGES && !inVoice) {
+    if (msgs <= MAX_MESSAGES) {
       out.push({
         tag: member.user.tag, id: member.id, msgs,
         lastTs: lastDay ? lastDay * DAY : 0,
@@ -230,7 +214,7 @@ function buildText(list) {
     `${i.tag} | ${i.id} | messages: ${i.msgs} | last msg day: ${iso(i.lastTs)} | joined: ${iso(i.joined)}`);
   return [
     `Inactive members - generated ${new Date().toISOString()}`,
-    `Criteria: <= ${MAX_MESSAGES} messages and no voice activity in the last ${WINDOW_DAYS} days`,
+    `Criteria: <= ${MAX_MESSAGES} messages in the last ${WINDOW_DAYS} days`,
     `Excluded: bots and exempt roles`,
     `Total: ${list.length}`,
     '---',
@@ -269,7 +253,7 @@ function renderPage(list, page) {
     embed
       .setColor(0x2ecc71)
       .setTitle('✅ No inactive members')
-      .setDescription(`Everyone has more than **${MAX_MESSAGES}** messages or voice activity in the last **${WINDOW_DAYS} days**.`);
+      .setDescription(`Everyone has more than **${MAX_MESSAGES}** messages in the last **${WINDOW_DAYS} days**.`);
     return { payload: { embeds: [embed], components: [] }, page: 0 };
   }
 
@@ -285,7 +269,7 @@ function renderPage(list, page) {
     .setColor(0xe67e22)
     .setTitle('😴 Inactive member report')
     .setDescription(
-      `**${list.length}** member${list.length === 1 ? '' : 's'} with **≤ ${MAX_MESSAGES} messages** and **no voice activity** in the last **${WINDOW_DAYS} days**.\n\n` +
+      `**${list.length}** member${list.length === 1 ? '' : 's'} with **≤ ${MAX_MESSAGES} messages** in the last **${WINDOW_DAYS} days**.\n\n` +
       rows.join('\n\n'))
     .setFooter({ text: `Page ${page + 1}/${pages}` });
 
