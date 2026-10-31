@@ -1,232 +1,374 @@
-// index.js
-// Discord bot: reposts messages that match a filter list, contain any
-// attachment (including GIF and MP4 files), or contain any link (including
-// GIF and MP4 links) via a per-channel webhook using the original author's
-// name + avatar. Reposts are identical to the original: text, links, and
-// attachments. The original is deleted only after the repost succeeds.
-
+require('dotenv').config(); // loads .env if present; real env vars still win
+const fs = require('fs');
+const path = require('path');
 const {
-  Client,
-  GatewayIntentBits,
-  Partials,
-  PermissionsBitField,
-  AttachmentBuilder,
+  Client, GatewayIntentBits, AttachmentBuilder, EmbedBuilder,
+  ActionRowBuilder, ButtonBuilder, ButtonStyle,
+  ChannelType, PermissionFlagsBits, Events,
 } = require('discord.js');
-require('dotenv').config();
 
-const { BLACKLIST } = require('./filters');
-const ALLOWED_GUILD_ID = process.env.GUILD_ID;
+// ---------- config (env vars) ----------
+const {
+  DISCORD_TOKEN, GUILD_ID, REPORT_CHANNEL_ID, BACKUP_CHANNEL_ID,
+} = process.env;
+const WINDOW_DAYS = Number(process.env.INACTIVE_DAYS || 3);        // how many days to look back
+const MAX_MESSAGES = Number(process.env.MAX_MESSAGES ?? 5);         // <= this many msgs = inactive
+const REPORT_HOUR_UTC = Number(process.env.REPORT_HOUR_UTC ?? 12);  // daily report time (UTC hour)
+const BACKFILL_CAP = Number(process.env.BACKFILL_CAP ?? 5000);      // max msgs scanned per channel on boot
+const EXEMPT_ROLE_IDS = (process.env.EXEMPT_ROLE_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 
+const DAY = 86400000;
+const DATA_FILE = path.join(DATA_DIR, 'activity.txt');
+const BAK_FILE = DATA_FILE + '.bak';
+const INACTIVE_FILE = path.join(DATA_DIR, 'inactives.txt');
+
+if (!DISCORD_TOKEN || !GUILD_ID || !REPORT_CHANNEL_ID) {
+  console.error('Missing DISCORD_TOKEN, GUILD_ID or REPORT_CHANNEL_ID');
+  process.exit(1);
+}
+
+// ---------- state ----------
+// users[userId] = { d: { "<dayIndex>": messageCount } }
+let state = { version: 1, lastReport: null, heartbeat: 0, users: {} };
+let loadedFrom = null;
+let ready = false; // true once boot backfill is finished
+
+const dayKey = (ts = Date.now()) => Math.floor(ts / DAY);
+
+function bumpMessage(userId, ts = Date.now()) {
+  const u = (state.users[userId] ??= { d: {} });
+  const k = dayKey(ts);
+  u.d[k] = (u.d[k] || 0) + 1;
+}
+function pruneData() {
+  const minKey = dayKey() - WINDOW_DAYS; // keep keys >= minKey (full window + today)
+  for (const [id, u] of Object.entries(state.users)) {
+    for (const k of Object.keys(u.d)) if (Number(k) < minKey) delete u.d[k];
+    if (!Object.keys(u.d).length) delete state.users[id];
+  }
+}
+
+// ---------- persistence (local .txt + .bak + Discord backup) ----------
+function tryRead(file) {
+  try {
+    const s = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (s && typeof s.users === 'object') return s;
+  } catch { /* missing or corrupt */ }
+  return null;
+}
+
+function loadLocal() {
+  const s = tryRead(DATA_FILE) || tryRead(BAK_FILE);
+  if (s) { state = { ...state, ...s }; loadedFrom = 'local file'; }
+}
+
+function saveLocal() {
+  try {
+    state.heartbeat = Date.now();
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const tmp = DATA_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(state));        // write new copy first...
+    if (fs.existsSync(DATA_FILE)) fs.copyFileSync(DATA_FILE, BAK_FILE);
+    fs.renameSync(tmp, DATA_FILE);                       // ...then swap atomically
+  } catch (e) {
+    console.warn('saveLocal failed:', e.message);
+  }
+}
+
+async function backupChannel() {
+  if (!BACKUP_CHANNEL_ID) return null;
+  const ch = await client.channels.fetch(BACKUP_CHANNEL_ID).catch(() => null);
+  return ch?.isTextBased() ? ch : null;
+}
+
+async function backupToDiscord() {
+  try {
+    const ch = await backupChannel();
+    if (!ch) return;
+    saveLocal();
+    await ch.send({
+      content: `Backup ${new Date().toISOString()}`,
+      files: [new AttachmentBuilder(Buffer.from(JSON.stringify(state)), { name: 'activity.txt' })],
+    });
+    // keep only the 5 newest backups
+    const recent = await ch.messages.fetch({ limit: 50 });
+    const mine = [...recent.values()]
+      .filter(m => m.author.id === client.user.id && m.attachments.size)
+      .sort((a, b) => b.createdTimestamp - a.createdTimestamp);
+    for (const m of mine.slice(5)) await m.delete().catch(() => {});
+  } catch (e) {
+    console.warn('backupToDiscord failed:', e.message);
+  }
+}
+
+async function restoreFromDiscord() {
+  try {
+    const ch = await backupChannel();
+    if (!ch) return;
+    const recent = await ch.messages.fetch({ limit: 50 });
+    const newest = [...recent.values()]
+      .filter(m => m.author.id === client.user.id && m.attachments.size)
+      .sort((a, b) => b.createdTimestamp - a.createdTimestamp)[0];
+    if (!newest) return;
+    const res = await fetch(newest.attachments.first().url);
+    const s = await res.json();
+    if (s && typeof s.users === 'object') {
+      state = { ...state, ...s };
+      loadedFrom = 'Discord backup';
+    }
+  } catch (e) {
+    console.warn('restoreFromDiscord failed:', e.message);
+  }
+}
+
+// ---------- client ----------
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildWebhooks,
+    GatewayIntentBits.GuildMembers,      // privileged: enable in Dev Portal
+    GatewayIntentBits.GuildMessages,     // no Message Content intent needed
   ],
-  partials: [Partials.Message, Partials.Channel],
 });
 
-// Cache webhooks per channel so we don't create a new one on every message.
-const webhookCache = new Map(); // channelId -> Webhook
+client.on(Events.MessageCreate, m => {
+  if (m.guildId !== GUILD_ID || m.author.bot || m.webhookId) return;
+  bumpMessage(m.author.id, m.createdTimestamp);
+});
 
-// Remembers the ORIGINAL text and author of every message we repost, keyed by
-// the repost's message ID. Replying to a repost then quotes the clean text and
-// mentions the real user (the repost's own author is just the webhook).
-const repostCache = new Map(); // repostMessageId -> { content, authorId }
-const REPOST_CACHE_LIMIT = 5000;
+client.on(Events.GuildMemberRemove, m => {
+  if (m.guild.id === GUILD_ID) delete state.users[m.id];
+});
 
-const WEBHOOK_NAME = 'filter-relay';
+// ---------- boot backfill (fills gaps from downtime) ----------
+async function backfill(guild) {
+  const bootTs = Date.now();
+  const after = Math.max(state.heartbeat || 0, (dayKey(bootTs) - WINDOW_DAYS) * DAY - 1);
+  const me = guild.members.me;
+  const channels = guild.channels.cache.filter(c =>
+    (c.type === ChannelType.GuildText || c.type === ChannelType.GuildAnnouncement) &&
+    c.permissionsFor(me)?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory]));
 
-// Matches any link.
-const LINK_PATTERN = /https?:\/\/\S+/i;
-
-/**
- * Removes links from text, used for quoted reply snippets only.
- */
-function stripLinks(content) {
-  if (!content) return content;
-  return content.replace(/https?:\/\/\S+/gi, '').replace(/[ \t]+\n/g, '\n').trim();
-}
-
-/**
- * Removes the reply header line (current and older formats) that this bot
- * prepends to reposted replies, so quoting a reply only shows its own text.
- */
-function stripReplyPrefix(content) {
-  if (!content) return content;
-  let text = content;
-  const header = /^\s*(?:-#|Replying to|>)[^\n]*(?:\n|$)/;
-  // Keep removing while the first line is a header that contains a mention.
-  while (header.test(text) && /<@!?\d+>/.test(text.split('\n')[0])) {
-    text = text.replace(header, '');
+  console.log(`Backfilling ${channels.size} channels since ${new Date(after).toISOString()}`);
+  for (const ch of channels.values()) {
+    let before;
+    let seen = 0;
+    try {
+      while (seen < BACKFILL_CAP) {
+        const batch = await ch.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+        if (!batch.size) break;
+        let reachedOld = false;
+        for (const m of batch.values()) {
+          if (m.createdTimestamp <= after) { reachedOld = true; continue; }
+          if (m.createdTimestamp >= bootTs) continue; // live handler already counted these
+          if (!m.author.bot && !m.webhookId) bumpMessage(m.author.id, m.createdTimestamp);
+        }
+        seen += batch.size;
+        before = batch.last().id;
+        if (reachedOld) break;
+      }
+    } catch (e) {
+      console.warn(`Backfill skipped #${ch.name}: ${e.message}`);
+    }
   }
-  return text;
 }
 
-/**
- * Whole-word, case-insensitive check for whether any word in `words`
- * appears in `text`.
- */
-function containsBlacklistedWord(text, words) {
-  if (!text) return false;
-  const lower = text.toLowerCase();
-  return words.some((word) => {
-    const escaped = word.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const pattern = new RegExp(`\\b${escaped}\\b`, 'i');
-    return pattern.test(lower);
+// ---------- inactivity detection ----------
+async function findInactives(guild) {
+  // member cache is already filled at boot and kept live by the GuildMembers intent;
+  // re-fetching here trips Discord's member-request rate limit (opcode 8)
+  if (guild.members.cache.size < guild.memberCount) {
+    try { await guild.members.fetch(); } catch (e) { console.warn('Member fetch skipped:', e.message); }
+  }
+  const now = Date.now();
+  const minKey = dayKey() - WINDOW_DAYS;
+  const out = [];
+
+  for (const member of guild.members.cache.values()) {
+    if (member.user.bot) continue;
+    if (EXEMPT_ROLE_IDS.some(r => member.roles.cache.has(r))) continue;
+
+    const u = state.users[member.id];
+    let msgs = 0;
+    let lastDay = 0;
+    if (u) {
+      for (const [k, n] of Object.entries(u.d)) {
+        if (Number(k) >= minKey) { msgs += n; lastDay = Math.max(lastDay, Number(k)); }
+      }
+    }
+    if (msgs <= MAX_MESSAGES) {
+      out.push({
+        tag: member.user.tag, id: member.id, msgs,
+        lastTs: lastDay ? lastDay * DAY : 0,
+        joined: member.joinedTimestamp || 0,
+      });
+    }
+  }
+  out.sort((a, b) => a.msgs - b.msgs || a.joined - b.joined);
+  return out;
+}
+
+function buildText(list) {
+  const iso = ts => (ts ? new Date(ts).toISOString().slice(0, 10) : 'none in window');
+  const lines = list.map(i =>
+    `${i.tag} | ${i.id} | messages: ${i.msgs} | last msg day: ${iso(i.lastTs)} | joined: ${iso(i.joined)}`);
+  return [
+    `Inactive members - generated ${new Date().toISOString()}`,
+    `Criteria: <= ${MAX_MESSAGES} messages in the last ${WINDOW_DAYS} days`,
+    `Excluded: bots and exempt roles`,
+    `Total: ${list.length}`,
+    '---',
+    ...lines,
+  ].join('\n');
+}
+
+async function buildReport() {
+  pruneData();
+  const guild = await client.guilds.fetch(GUILD_ID);
+  await guild.channels.fetch();
+  const list = await findInactives(guild);
+  const text = buildText(list);
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); fs.writeFileSync(INACTIVE_FILE, text); } catch { /* ignore */ }
+  return { list, text };
+}
+
+// ---------- pretty report (embed + buttons) ----------
+const PAGE_SIZE = 10;
+const reportCache = new Map(); // messageId -> { list, text, page }
+
+function cacheReport(messageId, list, text) {
+  reportCache.set(messageId, { list, text, page: 0 });
+  if (reportCache.size > 20) reportCache.delete(reportCache.keys().next().value);
+}
+
+const stamp = ts => `<t:${Math.floor(ts / 1000)}:D>`;
+
+function renderPage(list, page) {
+  const pages = Math.max(1, Math.ceil(list.length / PAGE_SIZE));
+  page = Math.min(Math.max(page, 0), pages - 1);
+
+  const embed = new EmbedBuilder().setTimestamp();
+
+  if (!list.length) {
+    embed
+      .setColor(0x2ecc71)
+      .setTitle('✅ No inactive members')
+      .setDescription(`Everyone has more than **${MAX_MESSAGES}** messages in the last **${WINDOW_DAYS} days**.`);
+    return { payload: { embeds: [embed], components: [] }, page: 0 };
+  }
+
+  const slice = list.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
+  const rows = slice.map((m, idx) => {
+    const n = page * PAGE_SIZE + idx + 1;
+    const last = m.lastTs ? stamp(m.lastTs) : 'none in window';
+    const joined = m.joined ? stamp(m.joined) : 'unknown';
+    return `**${n}.** <@${m.id}> · \`${m.id}\`\n└ 💬 ${m.msgs} msg${m.msgs === 1 ? '' : 's'} · last msg: ${last} · joined: ${joined}`;
   });
+
+  embed
+    .setColor(0xe67e22)
+    .setTitle('😴 Inactive member report')
+    .setDescription(
+      `**${list.length}** member${list.length === 1 ? '' : 's'} with **≤ ${MAX_MESSAGES} messages** in the last **${WINDOW_DAYS} days**.\n\n` +
+      rows.join('\n\n'))
+    .setFooter({ text: `Page ${page + 1}/${pages}` });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('inact_prev').setLabel('◀').setStyle(ButtonStyle.Secondary).setDisabled(page === 0),
+    new ButtonBuilder().setCustomId('inact_page').setLabel(`${page + 1}/${pages}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
+    new ButtonBuilder().setCustomId('inact_next').setLabel('▶').setStyle(ButtonStyle.Secondary).setDisabled(page >= pages - 1),
+    new ButtonBuilder().setCustomId('inact_txt').setLabel('Export .txt').setEmoji('📄').setStyle(ButtonStyle.Primary),
+  );
+  return { payload: { embeds: [embed], components: [row] }, page };
 }
 
-/**
- * Returns true if the message content contains any blacklisted word.
- */
-function isFiltered(content) {
-  return containsBlacklistedWord(content, BLACKLIST);
-}
-
-/**
- * Get or create the bot's webhook in a given text channel.
- */
-async function getWebhook(channel) {
-  if (webhookCache.has(channel.id)) {
-    return webhookCache.get(channel.id);
-  }
-
-  // Need MANAGE_WEBHOOKS permission in this channel.
-  const me = channel.guild.members.me;
-  if (!channel.permissionsFor(me).has(PermissionsBitField.Flags.ManageWebhooks)) {
-    console.warn(`Missing Manage Webhooks permission in #${channel.name}`);
-    return null;
-  }
-
-  const existing = await channel.fetchWebhooks();
-  let webhook = existing.find((wh) => wh.name === WEBHOOK_NAME && wh.owner?.id === client.user.id);
-
-  if (!webhook) {
-    webhook = await channel.createWebhook({
-      name: WEBHOOK_NAME,
-      reason: 'Used to relay filtered messages under the original author\'s identity',
-    });
-  }
-
-  webhookCache.set(channel.id, webhook);
-  return webhook;
-}
-
-client.on('messageCreate', async (message) => {
+async function maybeDailyReport() {
+  if (!ready) return;
+  const now = new Date();
+  const today = now.toISOString().slice(0, 10);
+  if (state.lastReport === today || now.getUTCHours() < REPORT_HOUR_UTC) return;
   try {
-    if (message.author.bot) return; // ignore bots/webhooks (avoid loops)
-    if (!message.guild) return; // ignore DMs
-    if (ALLOWED_GUILD_ID && message.guild.id !== ALLOWED_GUILD_ID) return;
+    const { list, text } = await buildReport();
+    const ch = await client.channels.fetch(REPORT_CHANNEL_ID);
+    const msg = await ch.send(renderPage(list, 0).payload);
+    cacheReport(msg.id, list, text);
+    state.lastReport = today;
+    saveLocal();
+    await backupToDiscord();
+  } catch (e) {
+    console.warn('Daily report failed (will retry):', e.message);
+  }
+}
 
-    const attachments = [...message.attachments.values()];
-    const hasFilteredText = isFiltered(message.content);
-    const hasAnyAttachment = attachments.length > 0;
-    const hasLink = LINK_PATTERN.test(message.content ?? '');
-
-    // Nothing to do unless the text is flagged, the message has any
-    // attachment (GIF/MP4 included), or it contains a link (GIF/MP4 included).
-    if (!hasFilteredText && !hasAnyAttachment && !hasLink) return;
-
-    const channel = message.channel;
-
-    // Need permission to delete messages in this channel.
-    const me = message.guild.members.me;
-    if (!channel.permissionsFor(me).has(PermissionsBitField.Flags.ManageMessages)) {
-      console.warn(`Missing Manage Messages permission in #${channel.name}`);
+// ---------- interactions: /inactives + page buttons ----------
+client.on(Events.InteractionCreate, async i => {
+  try {
+    if (i.isChatInputCommand() && i.commandName === 'inactives') {
+      if (!ready) return i.reply({ content: 'Still catching up on history, try again in a few minutes.', ephemeral: true });
+      await i.deferReply({ ephemeral: true });
+      const { list, text } = await buildReport();
+      const msg = await i.editReply(renderPage(list, 0).payload);
+      cacheReport(msg.id, list, text);
       return;
     }
 
-    const webhook = await getWebhook(channel);
-    if (!webhook) return;
-
-    const displayName = message.member?.displayName ?? message.author.username;
-    const avatarURL = message.author.displayAvatarURL({ extension: 'png', size: 256 });
-
-    // Download every attachment now, before the original is deleted, so the
-    // repost contains the real file bytes.
-    const files = await Promise.all(
-      attachments.map(async (a) => {
-        const res = await fetch(a.url);
-        if (!res.ok) throw new Error(`Failed to download ${a.name}: HTTP ${res.status}`);
-        const buffer = Buffer.from(await res.arrayBuffer());
-        return new AttachmentBuilder(buffer, { name: a.name });
-      })
-    );
-
-    // Webhooks can't trigger Discord's native "replying to" UI (that's a
-    // platform limitation, not a library one). Closest match: a real mention
-    // (renders as a blue pill even without pinging) followed by the quoted
-    // snippet as a masked link that jumps to the original message.
-    let replyPrefix = '';
-    if (message.reference?.messageId) {
-      try {
-        const referenced = await message.fetchReference();
-
-        // Drop any reply header the referenced message carries (it may itself
-        // be a reposted reply) BEFORE stripping links, so only its own text is quoted.
-        const cached = repostCache.get(referenced.id);
-        const refAuthorId = cached?.authorId ?? referenced.author.id;
-        const refText = cached
-          ? cached.content
-          : stripReplyPrefix(referenced.content ?? '');
-        const rawRefContent = refText.length ? stripLinks(refText) : '';
-        let snippet = rawRefContent
-          .replace(/<@[!&]?\d+>/g, '')                // no raw mention tokens in the quote
-          .replace(/\s*\n+\s*/g, ' ')                 // collapse newlines
-          .replace(/([\[\]\\*_~`|])/g, '\\$1');       // escape markdown that would break the link
-        if (snippet.length > 60) snippet = `${snippet.slice(0, 60).trimEnd()}…`;
-
-        if (!snippet) {
-          const first = referenced.attachments.first();
-          const type = first?.contentType ?? '';
-          if (type.startsWith('image/')) snippet = '🖼️ Image';
-          else if (type.startsWith('video/')) snippet = '🎬 Video';
-          else if (first) snippet = '📎 Attachment';
-          else snippet = 'Click to see message';
-        }
-
-        const jumpUrl = `https://discord.com/channels/${message.reference.guildId ?? message.guild.id}/${message.reference.channelId}/${message.reference.messageId}`;
-
-        replyPrefix = `-# ↩ Replying to <@${refAuthorId}> [${snippet}](${jumpUrl})\n`;
-      } catch (err) {
-        console.warn('Could not fetch referenced message (it may have been deleted):', err.message);
+    if (i.isButton() && i.customId.startsWith('inact_')) {
+      if (!i.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+        return i.reply({ content: 'You need Manage Server to use this.', ephemeral: true });
       }
-    }
-
-    // Repost FIRST, with the original text, links, and attachments. Only
-    // delete the original once the repost has succeeded.
-    const sent = await webhook.send({
-      content: `${replyPrefix}${message.content ?? ''}`.trim() || undefined,
-      username: displayName,
-      avatarURL,
-      files: files.length ? files : undefined,
-      // If this channel is a thread, target it explicitly:
-      threadId: channel.isThread() ? channel.id : undefined,
-      // Render the mention's blue pill but don't actually ping them again.
-      allowedMentions: { users: [] },
-    });
-
-    if (sent?.id) {
-      repostCache.set(sent.id, {
-        content: message.content ?? '',
-        authorId: message.author.id,
-      });
-      if (repostCache.size > REPOST_CACHE_LIMIT) {
-        repostCache.delete(repostCache.keys().next().value);
+      const entry = reportCache.get(i.message.id);
+      if (!entry) {
+        return i.reply({ content: 'This report expired (the bot restarted). Run `/inactives` for a fresh one.', ephemeral: true });
       }
+      if (i.customId === 'inact_txt') {
+        const file = new AttachmentBuilder(Buffer.from(entry.text), { name: `inactives-${new Date().toISOString().slice(0, 10)}.txt` });
+        return i.reply({ files: [file], ephemeral: true });
+      }
+      entry.page += i.customId === 'inact_next' ? 1 : -1;
+      const { payload, page } = renderPage(entry.list, entry.page);
+      entry.page = page;
+      return i.update(payload);
     }
-
-    await message.delete();
-  } catch (err) {
-    console.error('Error handling message:', err);
+  } catch (e) {
+    console.warn('Interaction failed:', e.message);
+    if (i.deferred && !i.replied) i.editReply(`Failed: ${e.message}`).catch(() => {});
   }
 });
 
-client.once('ready', () => {
+// ---------- startup ----------
+loadLocal();
+
+client.once(Events.ClientReady, async () => {
   console.log(`Logged in as ${client.user.tag}`);
-  console.log('Build: reply-v4 (jump link + "Replying to" + nested-reply fix)');
+  const guild = await client.guilds.fetch(GUILD_ID);
+  await guild.members.fetch();
+  await guild.channels.fetch();
+
+  if (!loadedFrom) await restoreFromDiscord(); // local data lost (free host wipe) -> pull from Discord
+  console.log(loadedFrom ? `Loaded data from ${loadedFrom}` : 'No saved data, starting fresh');
+
+  await guild.commands.set([{
+    name: 'inactives',
+    description: 'Generate the inactive member list now',
+    defaultMemberPermissions: PermissionFlagsBits.ManageGuild.toString(),
+  }]);
+
+  await backfill(guild);
+  pruneData();
+  saveLocal();
+  ready = true;
+  console.log('Backfill done, tracking live');
+
+  setInterval(saveLocal, 30 * 1000);
+  setInterval(backupToDiscord, 30 * 60 * 1000);
+  setInterval(maybeDailyReport, 5 * 60 * 1000);
+  maybeDailyReport();
 });
 
-client.login(process.env.DISCORD_TOKEN);
+// final save on shutdown (Railway etc. send SIGTERM on redeploy)
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, async () => { saveLocal(); await backupToDiscord(); process.exit(0); });
+}
+process.on('unhandledRejection', e => console.warn('Unhandled:', e));
+
+client.login(DISCORD_TOKEN);
