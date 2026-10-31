@@ -30,6 +30,12 @@ const client = new Client({
 // Cache webhooks per channel so we don't create a new one on every message.
 const webhookCache = new Map(); // channelId -> Webhook
 
+// Remembers the ORIGINAL text and author of every message we repost, keyed by
+// the repost's message ID. Replying to a repost then quotes the clean text and
+// mentions the real user (the repost's own author is just the webhook).
+const repostCache = new Map(); // repostMessageId -> { content, authorId }
+const REPOST_CACHE_LIMIT = 5000;
+
 const WEBHOOK_NAME = 'filter-relay';
 
 // Matches any link.
@@ -49,10 +55,13 @@ function stripLinks(content) {
  */
 function stripReplyPrefix(content) {
   if (!content) return content;
-  return content.replace(
-    /^(?:-# ↩ <@!?\d+> .*|Replying to <@!?\d+>: .*|> ↪️ <@!?\d+> .*)(?:\n|$)/,
-    ''
-  );
+  let text = content;
+  const header = /^\s*(?:-#|Replying to|>)[^\n]*(?:\n|$)/;
+  // Keep removing while the first line is a header that contains a mention.
+  while (header.test(text) && /<@!?\d+>/.test(text.split('\n')[0])) {
+    text = text.replace(header, '');
+  }
+  return text;
 }
 
 /**
@@ -157,7 +166,11 @@ client.on('messageCreate', async (message) => {
 
         // Drop any reply header the referenced message carries (it may itself
         // be a reposted reply) BEFORE stripping links, so only its own text is quoted.
-        const refText = stripReplyPrefix(referenced.content ?? '');
+        const cached = repostCache.get(referenced.id);
+        const refAuthorId = cached?.authorId ?? referenced.author.id;
+        const refText = cached
+          ? cached.content
+          : stripReplyPrefix(referenced.content ?? '');
         const rawRefContent = refText.length ? stripLinks(refText) : '';
         let snippet = rawRefContent
           .replace(/\s*\n+\s*/g, ' ')                 // collapse newlines
@@ -175,7 +188,7 @@ client.on('messageCreate', async (message) => {
 
         const jumpUrl = `https://discord.com/channels/${message.reference.guildId ?? message.guild.id}/${message.reference.channelId}/${message.reference.messageId}`;
 
-        replyPrefix = `-# ↩ <@${referenced.author.id}> [${snippet}](${jumpUrl})\n`;
+        replyPrefix = `-# ↩ <@${refAuthorId}> [${snippet}](${jumpUrl})\n`;
       } catch (err) {
         console.warn('Could not fetch referenced message (it may have been deleted):', err.message);
       }
@@ -183,7 +196,7 @@ client.on('messageCreate', async (message) => {
 
     // Repost FIRST, with the original text, links, and attachments. Only
     // delete the original once the repost has succeeded.
-    await webhook.send({
+    const sent = await webhook.send({
       content: `${replyPrefix}${message.content ?? ''}`.trim() || undefined,
       username: displayName,
       avatarURL,
@@ -193,6 +206,16 @@ client.on('messageCreate', async (message) => {
       // Render the mention's blue pill but don't actually ping them again.
       allowedMentions: { users: [] },
     });
+
+    if (sent?.id) {
+      repostCache.set(sent.id, {
+        content: message.content ?? '',
+        authorId: message.author.id,
+      });
+      if (repostCache.size > REPOST_CACHE_LIMIT) {
+        repostCache.delete(repostCache.keys().next().value);
+      }
+    }
 
     await message.delete();
   } catch (err) {
