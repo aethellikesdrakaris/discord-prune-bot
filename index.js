@@ -173,6 +173,7 @@ client.on('messageCreate', async (message) => {
           : stripReplyPrefix(referenced.content ?? '');
         const rawRefContent = refText.length ? stripLinks(refText) : '';
         let snippet = rawRefContent
+          .replace(/<@[!&]?\d+>/g, '')                // no raw mention tokens in the quote
           .replace(/\s*\n+\s*/g, ' ')                 // collapse newlines
           .replace(/([\[\]\\*_~`|])/g, '\\$1');       // escape markdown that would break the link
         if (snippet.length > 60) snippet = `${snippet.slice(0, 60).trimEnd()}…`;
@@ -188,7 +189,7 @@ client.on('messageCreate', async (message) => {
 
         const jumpUrl = `https://discord.com/channels/${message.reference.guildId ?? message.guild.id}/${message.reference.channelId}/${message.reference.messageId}`;
 
-        replyPrefix = `-# ↩ <@${refAuthorId}> [${snippet}](${jumpUrl})\n`;
+        replyPrefix = `-# ↩ Replying to <@${refAuthorId}> [${snippet}](${jumpUrl})\n`;
       } catch (err) {
         console.warn('Could not fetch referenced message (it may have been deleted):', err.message);
       }
