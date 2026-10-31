@@ -226,6 +226,7 @@ client.on('messageCreate', async (message) => {
 
 client.once('ready', () => {
   console.log(`Logged in as ${client.user.tag}`);
+  console.log('Build: reply-v4 (jump link + "Replying to" + nested-reply fix)');
 });
 
 client.login(process.env.DISCORD_TOKEN);
